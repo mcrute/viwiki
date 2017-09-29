@@ -1,0 +1,300 @@
+#!/usr/bin/env python2.7
+"""
+Wiki API and Editor
+by Mike Crute (mcrute@gmail.com)
+
+This module contains a full API for MoinMoin as well as a shim to download
+pages, present them in vim and upload the changes. Great care has been taken to
+ensure that this script relies only on the python standard library and that it
+is compatible with both Python 2.7+ and Python 3.0+
+
+This module is usually never on the pythonpath for a system but can be loaded
+into other python scripts for use by copying this function into their code.
+
+def get_wiki(path):
+    import imp, os.path
+    return imp.load_module('wiki', open(os.path.expanduser(path)), path,
+            [s for s in imp.get_suffixes() if s[0] == '.py'][0])
+
+To get a programatic handle to the API create a class like this which will
+parse ~/.wikivimrc and use the login info from the [wiki_name] key.
+
+>>> wiki = get_wiki('~/bin/viwiki')
+>>> api = wiki.WikiAPI(*wiki.get_credentials('wiki_name'))
+
+The API supports attachment handling but a separate program called wikiattach
+is used for managing attachments from the command line.
+"""
+
+import re
+import os
+import imp
+import sys
+import stat
+import os.path
+import tempfile
+import subprocess
+from codecs import open
+from optparse import OptionParser
+
+try:
+    from cStringIO import StringIO as BytesIO
+    from ConfigParser import SafeConfigParser
+    from xmlrpclib import ServerProxy, MultiCall, Fault, Binary
+except ImportError:
+    from io import BytesIO
+    from configparser import SafeConfigParser
+    from xmlrpc.client import ServerProxy, MultiCall, Fault, Binary
+
+
+def get_wiki_config(wiki_name=None):
+    """Parses wiki config file and provides config dictionary
+
+    Parses the ~/.wikivimrc file and returns a dictionary of config values for
+    the named wiki. If no wiki_name is passed the function will use the first
+    wiki defined in the file.
+    """
+    config = SafeConfigParser()
+    config.read(os.path.expanduser("~/.wikivimrc"))
+
+    section = wiki_name if wiki_name else config.sections()[0]
+
+    return dict(
+            (key, config.get(section, key))
+            for key in config.options(section))
+
+
+def get_wiki_api(wiki_name=None):
+    """Parses wiki config file and provides wiki API class
+
+    Parses the config file and looks for an `api` key in the wiki config. If
+    that is specified it must contain a string of wiki class name, colon, path
+    to wiki class file per the example below. That class will be imported and
+    returned, otherwise the default MoinMoin wiki API is returned.
+    """
+    config = get_wiki_config(wiki_name)
+    api = config.get("api", "WikiAPI").split(":")
+
+    if len(api) == 2:
+        module = imp.load_module(
+                'wiki_api', open(os.path.expanduser(api[1])), api[1],
+                [s for s in imp.get_suffixes() if s[0] == '.py'][0])
+        return getattr(module, api[0])
+    else:
+        return globals()[api[0]]
+
+
+def get_credentials(wiki_name=None):
+    """Parses wiki config file and provides credentials tuple
+
+    Parses the ~/.wikivimrc file and returns a credentials tuple suitable for
+    unpacking directly into to the WikiAPI constructor.
+
+    If no wiki_name is passed the function will use the first wiki defined in
+    the file.
+
+    The format of the file is:
+    [wikiname]
+    host = https://example.com/
+    username = foobear
+    password = secret
+    """
+    config = get_wiki_config(wiki_name)
+    return (config["host"], config.get("username"), config.get("password"))
+
+
+class WikiAPI(object):
+    """Low Level Wiki API
+
+    This class wraps the low level XMLRPC wiki interface and exposes higher
+    level methods that do specific tasks in a little bit more python friendly
+    way. This assumes a private wiki and requires credentials.
+    """
+
+    DEFAULT_FORMAT = "moin"
+
+    def __init__(self, host, username, password):
+        self.wiki = ServerProxy("{0}?action=xmlrpc2".format(host))
+        self.token = self.wiki.getAuthToken(username, password)
+
+    def __call__(self, method, *args):
+        proxy = MultiCall(self.wiki)
+        proxy.applyAuthToken(self.token)
+        getattr(proxy, method)(*args)
+        results = tuple(proxy())
+
+        if results[0] != "SUCCESS":
+            raise Exception("Authentication failed!")
+
+        return results[1]
+
+    def page_format(self, page, contents):
+        """Determine file format of a page
+        """
+        format = re.findall("#format (.*)", contents)
+        format = format[0] if len(format) else self.DEFAULT_FORMAT
+        return self.DEFAULT_FORMAT if format == "wiki" else format
+
+    def search(self, term):
+        # http://hg.moinmo.in/moin/1.9/file/tip/MoinMoin/xmlrpc/__init__.py#l683
+        return [page[0] for page in
+            self("searchPagesEx", term, "text", 0, False, 0, False)]
+
+    def get_page(self, page_name):
+        try:
+            return self("getPage", page_name).decode("utf-8")
+        except Fault as error:
+            if error.faultString == "No such page was found.":
+                return ""
+
+    def put_page(self, page_name, contents):
+        try:
+            return self("putPage", page_name, contents.encode("utf-8"))
+        except Fault  as error:
+            print(error)
+            return False
+
+    def list_attachments(self, page_name):
+        return self("listAttachments", page_name)
+
+    def get_attachment(self, page_name, attachment):
+        return BytesIO(self("getAttachment", page_name, attachment).data)
+
+    def put_attachment(self, page_name, name, contents):
+        data = Binary(contents.read())
+        self("putAttachment", page_name, name, data)
+
+    def delete_attachment(self, page_name, attachment):
+        self("deleteAttachment", page_name, attachment)
+
+
+class WikiEditor(object):
+    """Wiki Page Command Line Editor
+
+    This class handles editing and updating wiki pages based on arguments
+    passed on the command line. It requires a connected WikiAPI instance to do
+    its dirty work.
+    """
+
+    EDITOR_OPTIONS = {
+        "vim": "vim -c ':set wrap spell ft={format}' {filename}",
+    }
+
+    def __init__(self, wiki_api, editor=None):
+        self.api = wiki_api
+        self.editor = editor if editor else os.environ.get("EDITOR", "vim")
+        self.editor = self.EDITOR_OPTIONS.get(self.editor, self.editor)
+
+    @staticmethod
+    def _get_tempfile():
+        _, filename = tempfile.mkstemp()
+        return filename, open(filename, "w", "utf-8")
+
+    @staticmethod
+    def _file_last_updated(filename):
+        return os.stat(filename).st_mtime
+
+    def download_page(self, page):
+        page_contents = self.api.get_page(page)
+
+        filename, open_file = self._get_tempfile()
+        format = self.api.page_format(page, page_contents)
+
+        with open_file as fh:
+            fh.write(page_contents)
+
+        return filename, format
+
+    def upload_page(self, page, filename, timestamp):
+        updated_last = self._file_last_updated(filename)
+
+        if timestamp == updated_last:
+            print("Nothing changed")
+            return
+
+        with open(filename, "r", "utf-8") as fh:
+            contents = fh.read()
+
+        try:
+            if not self.api.put_page(page, contents):
+                raise Exception("failed to write page")
+        except:
+            print("Failed to save page.")
+            print("Contents exist in {!r}".format(filename))
+            return
+        finally:
+            del contents
+
+        os.unlink(filename)
+
+    def edit_page(self, page):
+        filename, format = self.download_page(page)
+        updated_first = self._file_last_updated(filename)
+
+        subprocess.call(
+                self.editor.format(format=format, filename=filename),
+                shell=True)
+
+        self.upload_page(page, filename, updated_first)
+
+
+class NonInteractiveEditor(WikiEditor):
+    """Non-Interactive Wiki Page Editor
+
+    This class handles editing and updating wiki pages based on arguments
+    passed on the command line. It requires a connected WikiAPI instance to do
+    its dirty work.
+    """
+
+    @staticmethod
+    def get_input(arg=None):
+        # cat foo.txt | viwiki PageName
+        # viwiki PageName < foo.txt
+        if (stat.S_IFMT(os.fstat(sys.stdin.fileno()).st_mode)
+                in (stat.S_IFREG, stat.S_IFIFO)):
+            if hasattr(sys.stdin, 'buffer'):
+                return sys.stdin.buffer
+            else:
+                return sys.stdin
+
+        if not arg:
+            return None
+
+        # viwiki PageName <(cat foo.txt)
+        # viwiki PageName /path/to/foo.txt
+        if os.path.exists(arg):
+            return open(arg, 'rb')
+
+    def edit_page(self, args):
+        input = self.get_input(args[1] if len(args) == 2 else None)
+
+        if input:
+            self.api.put_page(args[0], input.read().decode("utf-8"))
+        else:
+            sys.stdout.write(self.api.get_page(args[0]).encode("utf-8"))
+            sys.stdout.flush()
+
+
+def main(default_wiki=None):
+    parser = OptionParser()
+    parser.add_option("-n", "--non-interactive", dest="interactive",
+            help="Don't start vim", action="store_false", default=True)
+    parser.add_option("-w", "--wiki", dest="wiki", default=default_wiki,
+            help="Wiki config to use")
+    options, args = parser.parse_args()
+
+    api_class = get_wiki_api(options.wiki)
+    api = api_class(*get_credentials(options.wiki))
+
+    if len(args) == 0:
+        print("usage: viwiki <page name>")
+        return 1
+
+    if options.interactive:
+        WikiEditor(api).edit_page(args[0])
+    else:
+        NonInteractiveEditor(api).edit_page(args)
+
+
+if __name__ == "__main__":
+    main()
