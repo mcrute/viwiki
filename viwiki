@@ -2,6 +2,7 @@
 """
 Wiki API and Editor
 by Mike Crute (mcrute@gmail.com)
+licensed under the terms of the MIT license
 
 This module contains a full API for MoinMoin as well as a shim to download
 pages, present them in vim and upload the changes. Great care has been taken to
@@ -17,13 +18,29 @@ def get_wiki(path):
             [s for s in imp.get_suffixes() if s[0] == '.py'][0])
 
 To get a programatic handle to the API create a class like this which will
-parse ~/.wikivimrc and use the login info from the [wiki_name] key.
+parse the file pointed to by the WIKI_VIMRC environment variable, or the
+default value of ~/.wikivimrc, and use the login info from the [wiki_name] key.
 
 >>> wiki = get_wiki('~/bin/viwiki')
 >>> api = wiki.WikiAPI(*wiki.get_credentials('wiki_name'))
 
+The format of the ~/.wikivimrc file is:
+
+    [wikiname]
+    host = https://example.com/
+    username = foobear
+    password = secret
+
 The API supports attachment handling but a separate program called wikiattach
 is used for managing attachments from the command line.
+
+Alternate wiki APIs are supported through the configuration file. Alternate
+APIs must provide the WikiAPI interface including a constructor. To configure
+an alternate API add the api key to the wiki configuration with the format
+class:path (variables and ~ are expanded). For example:
+
+    [yourwiki]
+    api = YourWikiAPI:$HOME/bin/path/to/api.py
 """
 
 import re
@@ -47,6 +64,12 @@ except ImportError:
     from xmlrpc.client import ServerProxy, MultiCall, Fault, Binary
 
 
+def expand_path(path):
+    """Expand user and environment variables in a path
+    """
+    return os.path.expandvars(os.path.expanduser(path))
+
+
 def get_wiki_config(wiki_name=None):
     """Parses wiki config file and provides config dictionary
 
@@ -55,7 +78,7 @@ def get_wiki_config(wiki_name=None):
     wiki defined in the file.
     """
     config = SafeConfigParser()
-    config.read(os.path.expanduser("~/.wikivimrc"))
+    config.read(expand_path(os.environ.get("WIKI_VIMRC", "~/.wikivimrc")))
 
     section = wiki_name if wiki_name else config.sections()[0]
 
@@ -77,7 +100,7 @@ def get_wiki_api(wiki_name=None):
 
     if len(api) == 2:
         module = imp.load_module(
-                'wiki_api', open(os.path.expanduser(api[1])), api[1],
+                'wiki_api', open(expand_path(api[1])), api[1],
                 [s for s in imp.get_suffixes() if s[0] == '.py'][0])
         return getattr(module, api[0])
     else:
@@ -92,12 +115,6 @@ def get_credentials(wiki_name=None):
 
     If no wiki_name is passed the function will use the first wiki defined in
     the file.
-
-    The format of the file is:
-    [wikiname]
-    host = https://example.com/
-    username = foobear
-    password = secret
     """
     config = get_wiki_config(wiki_name)
     return (config["host"], config.get("username"), config.get("password"))
@@ -142,7 +159,7 @@ class WikiAPI(object):
 
     def get_page(self, page_name):
         try:
-            return self("getPage", page_name).decode("utf-8")
+            return self("getPage", page_name)
         except Fault as error:
             if error.faultString == "No such page was found.":
                 return ""
@@ -176,14 +193,15 @@ class WikiEditor(object):
     its dirty work.
     """
 
-    EDITOR_OPTIONS = {
-        "vim": "vim -c ':set wrap spell ft={format}' {filename}",
+    DEFAULT_CFG = "{editor} {filename}"
+    EDITOR_CFG = {
+        "vim": "{editor} -c ':set wrap spell ft={format}' {filename}",
     }
 
     def __init__(self, wiki_api, editor=None):
         self.api = wiki_api
-        self.editor = editor if editor else os.environ.get("EDITOR", "vim")
-        self.editor = self.EDITOR_OPTIONS.get(self.editor, self.editor)
+        self.editor_name = editor or os.environ.get("EDITOR", "vim")
+        self.editor = self.EDITOR_CFG.get(self.editor_name, self.DEFAULT_CFG)
 
     @staticmethod
     def _get_tempfile():
@@ -232,8 +250,9 @@ class WikiEditor(object):
         updated_first = self._file_last_updated(filename)
 
         subprocess.call(
-                self.editor.format(format=format, filename=filename),
-                shell=True)
+            self.editor.format(
+                editor=self.editor_name, format=format, filename=filename),
+            shell=True)
 
         self.upload_page(page, filename, updated_first)
 

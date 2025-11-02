@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import imp
+from optparse import OptionParser
+
+
+def get_wiki():
+    path = os.path.join(os.path.dirname(__file__), 'viwiki')
+    return imp.load_module('wiki', open(path), path,
+            [s for s in imp.get_suffixes() if s[0] == '.py'][0])
+
+
+class AttachmentHandler:
+
+    def __init__(self, api):
+        self.api = api
+
+    def delete(self, args):
+        page, attachment = args
+        self.api.delete_attachment(page, attachment)
+
+    def put(self, args):
+        page, attachment = args[:2]
+        wiki = get_wiki()
+        new_file = wiki.get_input(args[-1] if len(args) == 3 else None)
+
+        if hasattr(new_file, 'name'):
+            attachment = new_file.name
+
+        if not new_file:
+            print("No input file provided")
+        else:
+            self.api.put_attachment(page, attachment, new_file)
+
+    def get(self, args):
+        page, attachment, output = args
+        data = self.api.get_attachment(page, attachment)
+
+        if output == '-':
+            sys.stdout.buffer.write(data.read())
+            sys.stdout.flush()
+        else:
+            with open(output, 'wb') as fp:
+                fp.write(data.read())
+
+    def list(self, args):
+        page, = args
+        for att in self.api.list_attachments(page):
+            print(att)
+
+
+def main():
+    parser = OptionParser()
+    parser.add_option("-w", "--wiki", dest="wiki", help="Wiki config to use")
+    parser.add_option("-g", "--get", dest="get", action="store_true",
+        default=False, help="Download attachment")
+    parser.add_option("-d", "--delete", dest="delete", action="store_true",
+        default=False, help="Delete attachment")
+    parser.add_option("-p", "--put", dest="put", action="store_true",
+        default=False, help="Put new or revised attachment")
+    options, args = parser.parse_args()
+
+    wiki = get_wiki()
+    handler = AttachmentHandler(
+        wiki.WikiAPI(*wiki.get_credentials(options.wiki)))
+
+    try:
+        if options.delete:
+            handler.delete(args)
+        elif options.put:
+            handler.put(args)
+        elif options.get:
+            handler.get(args)
+        else:
+            handler.list(args)
+    except ValueError:
+        print("Not enough arguments for command")
+
+
+if __name__ == '__main__':
+    main()
